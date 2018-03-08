@@ -1,5 +1,6 @@
 import tempfile
 import sys
+from datetime import timedelta
 
 from django.core.management.base import BaseCommand
 from django.db import connection
@@ -53,8 +54,11 @@ class Command(BaseCommand):
                     # Close DB connection to avoid multiprocessing errors
                     connection.close()
 
-                    if not Email.objects.filter(status=STATUS.queued) \
-                            .filter(Q(scheduled_time__lte=now()) | Q(scheduled_time=None)).exists():
+                    if not Email.objects.filter(
+                        (Q(status=STATUS.queued) & (Q(scheduled_time__lte=now()) | Q(scheduled_time=None)))
+                        |
+                        Q(status=STATUS.retry, num_of_retries__gt=0)
+                    ).exists():
                         break
         except FileLocked:
             logger.info('Failed to acquire lock, terminating now.')

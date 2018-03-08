@@ -71,7 +71,7 @@ class MailTest(TestCase):
         self.assertEqual(Email.objects.filter(status=STATUS.sent).count(), 0)
         for i in range(3):
             Email.objects.create(**kwargs)
-        total_sent, total_failed = send_queued(processes=2)
+        total_sent, total_failed, total_retried = send_queued(processes=2)
         self.assertEqual(total_sent, 3)
 
     def test_send_bulk(self):
