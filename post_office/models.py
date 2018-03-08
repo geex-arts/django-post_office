@@ -22,7 +22,7 @@ from .validators import validate_email_with_name, validate_template_syntax
 
 
 PRIORITY = namedtuple('PRIORITY', 'low medium high now')._make(range(4))
-STATUS = namedtuple('STATUS', 'sent failed queued')._make(range(3))
+STATUS = namedtuple('STATUS', 'sent failed queued retry')._make(range(4))
 
 
 @python_2_unicode_compatible
@@ -34,7 +34,7 @@ class Email(models.Model):
     PRIORITY_CHOICES = [(PRIORITY.low, _("low")), (PRIORITY.medium, _("medium")),
                         (PRIORITY.high, _("high")), (PRIORITY.now, _("now"))]
     STATUS_CHOICES = [(STATUS.sent, _("sent")), (STATUS.failed, _("failed")),
-                      (STATUS.queued, _("queued"))]
+                      (STATUS.queued, _("queued")), (STATUS.retry, _("retry"))]
 
     from_email = models.CharField(_("Email From"), max_length=254,
                                   validators=[validate_email_with_name])
@@ -67,6 +67,8 @@ class Email(models.Model):
     context = context_field_class(_('Context'), blank=True, null=True)
     backend_alias = models.CharField(_('Backend alias'), blank=True, default='',
                                      max_length=64)
+    num_of_retries = models.PositiveSmallIntegerField(_("Number of retries"),
+                                                      default=0)
 
     class Meta:
         app_label = 'post_office'
@@ -136,10 +138,12 @@ class Email(models.Model):
         try:
             self.email_message().send()
             status = STATUS.sent
+            num_of_retries = 0
             message = ''
             exception_type = ''
         except Exception as e:
-            status = STATUS.failed
+            status = STATUS.retry if self.num_of_retries > 0 else STATUS.failed
+            num_of_retries = self.num_of_retries - 1 if self.num_of_retries > 0 else 0
             message = str(e)
             exception_type = type(e).__name__
 
@@ -150,7 +154,11 @@ class Email(models.Model):
 
         if commit:
             self.status = status
-            self.save(update_fields=['status'])
+            if status == STATUS.retry or status == STATUS.failed:
+                self.num_of_retries = num_of_retries
+                self.save(update_fields=['status', 'num_of_retries'])
+            else:
+                self.save(update_fields=['status'])
 
             if log_level is None:
                 log_level = get_log_level()
@@ -158,7 +166,7 @@ class Email(models.Model):
             # If log level is 0, log nothing, 1 logs only sending failures
             # and 2 means log both successes and failures
             if log_level == 1:
-                if status == STATUS.failed:
+                if status == STATUS.failed or status == STATUS.retry:
                     self.logs.create(status=status, message=message,
                                      exception_type=exception_type)
             elif log_level == 2:
@@ -178,7 +186,7 @@ class Log(models.Model):
     A model to record sending email sending activities.
     """
 
-    STATUS_CHOICES = [(STATUS.sent, _("sent")), (STATUS.failed, _("failed"))]
+    STATUS_CHOICES = [(STATUS.sent, _("sent")), (STATUS.failed, _("failed")), (STATUS.retry, _("retry"))]
 
     email = models.ForeignKey(Email, editable=False, related_name='logs',
                               verbose_name=_('Email address'), on_delete=models.CASCADE)

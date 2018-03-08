@@ -1,10 +1,11 @@
 from multiprocessing import Pool
 from multiprocessing.dummy import Pool as ThreadPool
+from datetime import timedelta
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import connection as db_connection
-from django.db.models import Q
+from django.db.models import Q, F
 from django.template import Context, Template
 from django.utils.timezone import now
 
@@ -23,7 +24,7 @@ logger = setup_loghandlers("INFO")
 def create(sender, recipients=None, cc=None, bcc=None, subject='', message='',
            html_message='', context=None, scheduled_time=None, headers=None,
            template=None, priority=None, render_on_delivery=False, commit=True,
-           backend=''):
+           backend='', num_of_retries=0):
     """
     Creates an email from supplied keyword arguments. If template is
     specified, email subject and content will be rendered during delivery.
@@ -50,7 +51,8 @@ def create(sender, recipients=None, cc=None, bcc=None, subject='', message='',
             bcc=bcc,
             scheduled_time=scheduled_time,
             headers=headers, priority=priority, status=status,
-            context=context, template=template, backend_alias=backend
+            context=context, template=template, backend_alias=backend,
+            num_of_retries=num_of_retries
         )
 
     else:
@@ -75,7 +77,7 @@ def create(sender, recipients=None, cc=None, bcc=None, subject='', message='',
             html_message=html_message,
             scheduled_time=scheduled_time,
             headers=headers, priority=priority, status=status,
-            backend_alias=backend
+            backend_alias=backend, num_of_retries=num_of_retries
         )
 
     if commit:
@@ -88,7 +90,7 @@ def send(recipients=None, sender=None, template=None, context=None, subject='',
          message='', html_message='', scheduled_time=None, headers=None,
          priority=None, attachments=None, render_on_delivery=False,
          log_level=None, commit=True, cc=None, bcc=None, language='',
-         backend=''):
+         backend='', num_of_retries=0):
 
     try:
         recipients = parse_emails(recipients)
@@ -142,7 +144,8 @@ def send(recipients=None, sender=None, template=None, context=None, subject='',
 
     email = create(sender, recipients, cc, bcc, subject, message, html_message,
                    context, scheduled_time, headers, template, priority,
-                   render_on_delivery, commit=commit, backend=backend)
+                   render_on_delivery, commit=commit, backend=backend,
+                   num_of_retries=num_of_retries)
 
     if attachments:
         attachments = create_attachments(attachments)
@@ -171,10 +174,15 @@ def get_queued():
     Returns a list of emails that should be sent:
      - Status is queued
      - Has scheduled_time lower than the current time or None
+     or
+     - Status is retry
     """
-    return Email.objects.filter(status=STATUS.queued) \
+    return Email.objects.filter(
+        (Q(status=STATUS.queued) & (Q(scheduled_time__lte=now()) | Q(scheduled_time=None)))
+        |
+        Q(status=STATUS.retry, num_of_retries__gt=0)
+    ) \
         .select_related('template') \
-        .filter(Q(scheduled_time__lte=now()) | Q(scheduled_time=None)) \
         .order_by(*get_sending_order()).prefetch_related('attachments')[:get_batch_size()]
 
 
@@ -183,7 +191,7 @@ def send_queued(processes=1, log_level=None):
     Sends out all queued mails that has scheduled_time less than now or None
     """
     queued_emails = get_queued()
-    total_sent, total_failed = 0, 0
+    total_sent, total_failed, total_retried = 0, 0, 0
     total_email = len(queued_emails)
 
     logger.info('Started sending %s emails with %s processes.' %
@@ -199,9 +207,9 @@ def send_queued(processes=1, log_level=None):
             processes = total_email
 
         if processes == 1:
-            total_sent, total_failed = _send_bulk(queued_emails,
-                                                  uses_multiprocessing=False,
-                                                  log_level=log_level)
+            total_sent, total_failed, total_retried = _send_bulk(queued_emails,
+                                                      uses_multiprocessing=False,
+                                                      log_level=log_level)
         else:
             email_lists = split_emails(queued_emails, processes)
 
@@ -211,13 +219,15 @@ def send_queued(processes=1, log_level=None):
 
             total_sent = sum([result[0] for result in results])
             total_failed = sum([result[1] for result in results])
-    message = '%s emails attempted, %s sent, %s failed' % (
+            total_retried = sum([result[2] for result in results])
+    message = '%s emails attempted, %s sent, %s failed, %s retried' % (
         total_email,
         total_sent,
-        total_failed
+        total_failed,
+        total_retried
     )
     logger.info(message)
-    return (total_sent, total_failed)
+    return (total_sent, total_failed, total_retried)
 
 
 def _send_bulk(emails, uses_multiprocessing=True, log_level=None):
@@ -232,6 +242,7 @@ def _send_bulk(emails, uses_multiprocessing=True, log_level=None):
 
     sent_emails = []
     failed_emails = []  # This is a list of two tuples (email, exception)
+    retry_emails = []  # This is a list of two tuples (email, exception)
     email_count = len(emails)
 
     logger.info('Process started, sending %s emails' % email_count)
@@ -243,8 +254,16 @@ def _send_bulk(emails, uses_multiprocessing=True, log_level=None):
             sent_emails.append(email)
             logger.debug('Successfully sent email #%d' % email.id)
         except Exception as e:
-            logger.debug('Failed to send email #%d' % email.id)
-            failed_emails.append((email, e))
+            if any(map(lambda x: x[0] == email, retry_emails)) \
+                    or any(map(lambda x: x[0] == email, failed_emails)):
+                return
+
+            if email.num_of_retries > 1:
+                logger.debug('Retrying to send failed email #%d' % email.id)
+                retry_emails.append((email, e))
+            else:
+                logger.debug('Failed to send email #%d' % email.id)
+                failed_emails.append((email, e))
 
     # Prepare emails before we send these to threads for sending
     # So we don't need to access the DB from within threads
@@ -254,7 +273,10 @@ def _send_bulk(emails, uses_multiprocessing=True, log_level=None):
         try:
             email.prepare_email_message()
         except Exception as e:
-            failed_emails.append((email, e))
+            if email.num_of_retries > 1:
+                retry_emails.append((email, e))
+            else:
+                failed_emails.append((email, e))
 
     number_of_threads = min(get_threads_per_process(), email_count)
     pool = ThreadPool(number_of_threads)
@@ -270,7 +292,10 @@ def _send_bulk(emails, uses_multiprocessing=True, log_level=None):
     Email.objects.filter(id__in=email_ids).update(status=STATUS.sent)
 
     email_ids = [email.id for (email, e) in failed_emails]
-    Email.objects.filter(id__in=email_ids).update(status=STATUS.failed)
+    Email.objects.filter(id__in=email_ids).update(status=STATUS.failed, num_of_retries=0)
+
+    email_ids = [email.id for (email, e) in retry_emails]
+    Email.objects.filter(id__in=email_ids).update(status=STATUS.retry, num_of_retries=F('num_of_retries') - 1)
 
     # If log level is 0, log nothing, 1 logs only sending failures
     # and 2 means log both successes and failures
@@ -280,6 +305,13 @@ def _send_bulk(emails, uses_multiprocessing=True, log_level=None):
         for (email, exception) in failed_emails:
             logs.append(
                 Log(email=email, status=STATUS.failed,
+                    message=str(exception),
+                    exception_type=type(exception).__name__)
+            )
+
+        for (email, exception) in retry_emails:
+            logs.append(
+                Log(email=email, status=STATUS.retry,
                     message=str(exception),
                     exception_type=type(exception).__name__)
             )
@@ -297,9 +329,10 @@ def _send_bulk(emails, uses_multiprocessing=True, log_level=None):
             Log.objects.bulk_create(logs)
 
     logger.info(
-        'Process finished, %s attempted, %s sent, %s failed' % (
-            email_count, len(sent_emails), len(failed_emails)
+        'Process finished, %s attempted, %s sent, %s failed, %s retried' % (
+            email_count, len(sent_emails), len(failed_emails),
+            len(retry_emails)
         )
     )
 
-    return len(sent_emails), len(failed_emails)
+    return len(sent_emails), len(failed_emails), len(retry_emails)
