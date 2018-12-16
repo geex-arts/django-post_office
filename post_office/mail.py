@@ -154,6 +154,11 @@ def send(recipients=None, sender=None, template=None, context=None, subject='',
     if priority == PRIORITY.now:
         email.dispatch(log_level=log_level)
 
+        # Workaround to fix the errors: "Connection unexpectedly closed" and
+        # "please run connect() first".
+        # Ref: https://github.com/ui/django-post_office/issues/218
+        connections.close()
+
     return email
 
 
